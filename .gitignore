@@ -19,13 +19,15 @@ htmlcov/
 .env
 *.local
 
-# Audio files & datasets
+# Audio files & datasets (allow in audio/ or samples/)
 *.wav
 *.mp3
 *.ogg
 *.flac
 *.m4a
 *.webm
+!audio/**
+!samples/**
 !tests/fixtures/**
 
 # OS generated
