@@ -129,13 +129,28 @@ def print_report(res_json, elapsed_total, audio_path):
         print("  " + "─" * 66)
         print(f"  {'Total Inference Latency':<38} {inf_s:>11.4f}s   {'100.0%':>12}")
 
-    scripts = out.get("detected_scripts", [])
+    scripts_dict = out.get("detected_scripts", {})
+    if isinstance(scripts_dict, dict):
+        active_scripts = [
+            k.replace("has_", "").title()
+            for k, v in scripts_dict.items()
+            if k.startswith("has_") and k != "has_indic" and v
+        ]
+        non_latin = scripts_dict.get("non_latin_count", 0)
+        script_display = (
+            "Pure Latin/English (0 non-Latin characters)"
+            if not active_scripts
+            else f"{', '.join(active_scripts)} ({non_latin} non-Latin chars)"
+        )
+    else:
+        script_display = str(scripts_dict)
+
     ban_applied = out.get("ban_applied", False)
     banned_cnt = out.get("banned_token_count", 0)
-    print("\n[4] GUARDRAILS & SCRIPTS")
+    print("\n[4] GUARDRAILS & SCRIPT ENFORCEMENT")
     print("─" * 78)
-    print(f" • Script Filter / Ban   : {'Active' if ban_applied else 'Disabled'} ({banned_cnt} tokens banned)")
-    print(f" • Detected Script(s)    : {', '.join(scripts) if scripts else 'None'}")
+    print(f" • Script Filter / Ban   : {'Active' if ban_applied else 'Disabled'} ({banned_cnt} banned tokens suppressed)")
+    print(f" • Detected Script(s)    : {script_display}")
 
     print("\n[5] TRANSCRIPTION")
     print("─" * 78)
