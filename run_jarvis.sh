@@ -14,6 +14,13 @@ echo "============================================================"
 echo " Starting Parrotlet ASR on JarvisLabs VM"
 echo "============================================================"
 
+# Activate virtual environment if present
+if [ -d "$HOME/venv" ]; then
+    source "$HOME/venv/bin/activate"
+elif [ -d "$DIR/venv" ]; then
+    source "$DIR/venv/bin/activate"
+fi
+
 # Verify GPU is accessible
 if command -v nvidia-smi &> /dev/null; then
     echo "[GPU Detection]"
