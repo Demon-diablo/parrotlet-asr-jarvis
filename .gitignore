@@ -1,0 +1,33 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Test & Cache
+.pytest_cache/
+.coverage
+htmlcov/
+/graft/
+
+# Secrets & Local Configs
+.env
+*.local
+
+# Audio files & datasets
+*.wav
+*.mp3
+*.ogg
+*.flac
+*.m4a
+*.webm
+!tests/fixtures/**
+
+# OS generated
+.DS_Store
+Thumbs.db

@@ -1,0 +1,1 @@
+"""Parrotlet ASR service — shared inference package (loader, pipeline, audio)."""

@@ -1,0 +1,25 @@
+# Parrotlet-a 2.5 Pro ASR on JarvisLabs GPU VM (RTX 6000 Ada / Ampere)
+#
+# Pinned per the upstream ekacare/parrotlet-a-2.5-pro requirements.
+# PyTorch with CUDA is pre-installed in the JarvisLabs base image.
+
+# Machine Learning & Hugging Face Stack
+transformers>=4.52.0,<5
+accelerate>=0.27.0
+safetensors>=0.4.0
+huggingface_hub>=0.23.0
+torchao>=0.11.0,<=0.13.0
+
+# Audio I/O & Resampling (apt: ffmpeg libsndfile1)
+librosa>=0.10.2,<0.12
+soundfile>=0.12.1
+numpy>=1.26,<3
+resampy>=0.4.3
+
+# Web Server (FastAPI + Uvicorn)
+fastapi==0.141.1
+pydantic==2.13.5
+python-multipart
+requests>=2.31
+uvicorn>=0.27.0
+httpx>=0.27.0

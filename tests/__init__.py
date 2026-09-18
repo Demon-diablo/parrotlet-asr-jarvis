@@ -1,0 +1,1 @@
+"""Tests for the Parrotlet ASR service (no GPU, no model download)."""
