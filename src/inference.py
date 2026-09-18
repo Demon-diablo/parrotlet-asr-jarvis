@@ -347,11 +347,16 @@ def _transcribe_batched(
             proj_device = enc_device
             proj_dtype = enc_dtype
 
+        t_enc0 = time.perf_counter()
         enc_out = speech_llm.encoder(audio_features)
         audio_embeddings = enc_out.last_hidden_state if hasattr(enc_out, "last_hidden_state") else enc_out
-        projected = speech_llm.projector(audio_embeddings.to(proj_device, dtype=proj_dtype))
         t_enc1 = time.perf_counter()
 
+        t_proj0 = time.perf_counter()
+        projected = speech_llm.projector(audio_embeddings.to(proj_device, dtype=proj_dtype))
+        t_proj1 = time.perf_counter()
+
+        t_prep0 = time.perf_counter()
         prompt = (
             speech_llm.get_prompt()
             if hasattr(speech_llm, "get_prompt") and callable(speech_llm.get_prompt)
@@ -512,12 +517,6 @@ def _transcribe_batched(
                 from transformers import StaticCache
                 tcfg = getattr(speech_llm.decoder.config, "text_config", speech_llm.decoder.config)
                 max_cache_len = min(2048, total + int(gen_kwargs.get("max_new_tokens", 256)) + 16)
-                # Reuse a pre-allocated cache across requests instead of
-                # cudaMalloc'ing + zero-initing new KV tensors every call —
-                # StaticCache.reset() clears it in place for the next
-                # request at effectively zero cost. Pool is small (real-time
-                # traffic is almost always B=1) and capped so it can't grow
-                # unbounded if window counts vary.
                 cache_key = (B, max_cache_len, str(dec_device), input_embeddings.dtype)
                 cache_pool = getattr(speech_llm, "_static_cache_pool", None)
                 if cache_pool is None:
@@ -546,15 +545,14 @@ def _transcribe_batched(
             except Exception as exc:
                 log.debug("StaticCache setup skipped: %s", exc)
 
+        t_prep1 = time.perf_counter()
+
         t_gen0 = time.perf_counter()
         out = speech_llm.decoder.generate(**gen_kwargs)
         t_gen1 = time.perf_counter()
 
+        t_tok0 = time.perf_counter()
         results = []
-        # Safety net only: generate() now stops as soon as it hits
-        # stop_token_ids (see gen_eos_id above), so this trim should rarely
-        # find anything left to cut. Kept in case a backend ignores a list
-        # eos_token_id and only honors the first sequence's stop.
         stop_ids = set(stop_token_ids) | {i for i in (1, 107) if isinstance(i, int)}
         _cap = int(gen_kwargs.get("max_new_tokens") or 0)
         gen_lens = []
@@ -563,11 +561,6 @@ def _transcribe_batched(
             eos_pos = [idx for idx, tok in enumerate(token_list) if tok in stop_ids]
             if eos_pos:
                 token_list = token_list[:eos_pos[0]]
-            # Observability for right-sizing MAX_NEW_TOKENS from real
-            # traffic: flag whenever a window actually needed the full cap
-            # (no early stop found at all) rather than guessing a lower
-            # value — truncating a real medical transcript is worse than
-            # a slightly conservative cap.
             if _cap and not eos_pos and len(token_list) >= _cap:
                 log.warning(
                     "window hit max_new_tokens cap (%d) with no stop token found — "
@@ -576,25 +569,30 @@ def _transcribe_batched(
                 )
             gen_lens.append(len(token_list))
             results.append(speech_llm.tokenizer.decode(token_list, skip_special_tokens=True).strip())
+        t_tok1 = time.perf_counter()
+
+        total_tokens = sum(gen_lens)
+        dec_time = max(1e-6, t_gen1 - t_gen0)
+        tok_per_sec = round(total_tokens / dec_time, 2)
+
         # Parallel-window proof: one batched GPU pass over B windows; per-window
         # generated lengths show whether decode early-stopped or ran the cap.
-        log.info(
-            "batched decode B=%d generated_tokens=%s phases=%s",
-            B, gen_lens,
-            {
-                "featurize_s": round(t_feat1 - t_feat0, 4),
-                "encode_s": round(t_enc1 - t_feat1, 4),
-                "decode_s": round(t_gen1 - t_gen0, 4),
-            },
-        )
+        phases_summary = {
+            "featurize_s": round(t_feat1 - t_feat0, 4),
+            "encode_s": round(t_proj1 - t_enc0, 4),
+            "whisper_encoder_s": round(t_enc1 - t_enc0, 4),
+            "projector_s": round(t_proj1 - t_proj0, 4),
+            "prompt_prep_s": round(t_prep1 - t_prep0, 4),
+            "decode_s": round(t_gen1 - t_gen0, 4),
+            "decoder_s": round(t_gen1 - t_gen0, 4),
+            "detokenize_s": round(t_tok1 - t_tok0, 4),
+            "tokens_generated": total_tokens,
+            "tokens_per_second": tok_per_sec,
+            "tokens_per_window": gen_lens,
+        }
+        log.info("batched decode B=%d generated_tokens=%s phases=%s", B, gen_lens, phases_summary)
         try:
-            # encode_s spans projector + prompt-prep + embed expansion too;
-            # decode_s is the pure generate() wall time.
-            speech_llm._last_phases = {
-                "featurize_s": round(t_feat1 - t_feat0, 4),
-                "encode_s": round(t_enc1 - t_feat1, 4),
-                "decode_s": round(t_gen1 - t_gen0, 4),
-            }
+            speech_llm._last_phases = phases_summary
         except Exception:
             pass
         return results
@@ -711,12 +709,21 @@ def transcribe_single_window(
     if ban_applied and bad_words is None and not banned_ids:
         ban_applied = False
 
+    phases = {}
+    try:
+        batched_phases = getattr(speech_llm, "_last_phases", None)
+        if isinstance(batched_phases, dict):
+            phases.update(batched_phases)
+    except Exception:
+        pass
+
     audio_sec = round(audio_module.audio_seconds(audio_window_16k), 3)
     decoder_output = {
         "transcript": raw_text,
         "audio_seconds": audio_sec,
         "native_sample_rate": 16000,
         "flushed_windows": 1,
+        "phases": phases,
         "ban_applied": ban_applied,
         "banned_token_count": len(banned_ids),
     }
@@ -749,7 +756,30 @@ def _run_decoder_real(model_bundle: Any, validated: Dict[str, Any], settings: Se
     t_audio0 = time.perf_counter()
 
     try:
-        audio_16k, native_sr, _ = audio_module.load_audio_for_inference(validated)
+        try:
+            load_res = audio_module.load_audio_for_inference(validated, return_details=True)
+        except TypeError:
+            load_res = audio_module.load_audio_for_inference(validated)
+
+        if isinstance(load_res, tuple) and len(load_res) == 4:
+            audio_16k, native_sr, _, audio_details = load_res
+        else:
+            audio_16k, native_sr, _ = load_res[:3]
+            audio_details = {
+                "original_sample_rate": int(native_sr),
+                "target_sample_rate": 16000,
+                "is_resampled_to_16k": bool(int(native_sr) != 16000),
+                "original_channels": 1,
+                "original_samples": len(audio_16k),
+                "total_16k_samples": len(audio_16k),
+                "duration_seconds": round(len(audio_16k) / 16000.0, 4),
+                "phases": {
+                    "decode_audio_s": 0.0,
+                    "mono_mix_s": 0.0,
+                    "resample_16k_s": 0.0,
+                    "silence_trim_s": 0.0,
+                },
+            }
     except InputValidationError:
         raise
     except Exception as exc:
@@ -766,8 +796,9 @@ def _run_decoder_real(model_bundle: Any, validated: Dict[str, Any], settings: Se
         audio_16k = audio_module.trim_audio_silence(audio_16k, top_db=35.0, margin_samples=3200)
 
     # Buffer the whole signal: contiguous 30 s windows, no overlap.
+    t_win0 = time.perf_counter()
     windows = audio_module.split_windows(audio_16k)
-    t_window1 = time.perf_counter()
+    t_win1 = time.perf_counter()
 
     log.debug(
         "Audio: native_sr=%d 16k_samples=%d duration=%.2fs windows=%d",
@@ -810,9 +841,16 @@ def _run_decoder_real(model_bundle: Any, validated: Dict[str, Any], settings: Se
 
     t_asm0 = time.perf_counter()
     transcript = audio_module.join_texts(parts)
+    t_asm1 = time.perf_counter()
+
     phases: Dict[str, Any] = {
-        "audio_s": round(t_window1 - t_audio0, 4),
-        "assemble_s": round(time.perf_counter() - t_asm0, 4),
+        "audio_prep_s": round(t_win1 - t_audio0, 4),
+        "audio_s": round(t_win1 - t_audio0, 4),
+        "audio_decode_s": audio_details.get("phases", {}).get("decode_audio_s", 0.0),
+        "mono_mix_s": audio_details.get("phases", {}).get("mono_mix_s", 0.0),
+        "resample_16k_s": audio_details.get("phases", {}).get("resample_16k_s", 0.0),
+        "windowing_s": round(t_win1 - t_win0, 4),
+        "assemble_s": round(t_asm1 - t_asm0, 4),
     }
     try:
         batched_phases = getattr(speech_llm, "_last_phases", None)
@@ -825,6 +863,7 @@ def _run_decoder_real(model_bundle: Any, validated: Dict[str, Any], settings: Se
         "transcript": transcript,
         "audio_seconds": round(audio_module.audio_seconds(audio_16k), 3),
         "native_sample_rate": int(native_sr),
+        "audio_info": audio_details,
         "flushed_windows": len(windows),
         "decode_path": decode_path,
         "phases": phases,
@@ -841,22 +880,55 @@ def _postprocess(decoder_output: Dict[str, Any], settings: Settings, elapsed: fl
     raw_transcript = decoder_output["transcript"]
     clean_enabled = bool(getattr(settings, "clean_transcript", True))
     transcript = clean_transcript(raw_transcript) if clean_enabled else raw_transcript
+
+    audio_dur = float(decoder_output["audio_seconds"])
+    inf_time = round(elapsed, 4)
+    rtf = round(inf_time / audio_dur, 4) if audio_dur > 0 else 0.0
+    speedup = round(audio_dur / inf_time, 2) if inf_time > 0 else 0.0
+
+    audio_info = decoder_output.get("audio_info", {})
+    native_sr = decoder_output.get("native_sample_rate", 16000)
+    phases = decoder_output.get("phases", {})
+    gen_tokens = phases.get("tokens_generated", 0)
+    tok_per_sec = phases.get("tokens_per_second", 0.0)
+
     out: Dict[str, Any] = {
         "transcript": transcript,
-        "audio_seconds": decoder_output["audio_seconds"],
-        "native_sample_rate": decoder_output["native_sample_rate"],
+        "audio_seconds": audio_dur,
+        "native_sample_rate": native_sr,
+        "audio_conversion": {
+            "original_sample_rate": audio_info.get("original_sample_rate", native_sr),
+            "target_sample_rate": 16000,
+            "is_resampled_to_16k": bool(audio_info.get("is_resampled_to_16k", native_sr != 16000)),
+            "original_channels": audio_info.get("original_channels", 1),
+            "total_16k_samples": audio_info.get("total_16k_samples", int(round(audio_dur * 16000))),
+            "duration_seconds": audio_dur,
+        },
+        "metrics": {
+            "audio_duration_s": audio_dur,
+            "inference_seconds": inf_time,
+            "real_time_factor_rtf": rtf,
+            "speedup_factor": f"{speedup}x",
+            "tokens_generated": gen_tokens,
+            "tokens_per_second": tok_per_sec,
+        },
         "generation": {
             "max_new_tokens": settings.max_new_tokens,
             "temperature": settings.temperature,
         },
-        "timing": {"inference_seconds": round(elapsed, 4)},
+        "timing": {
+            "inference_seconds": inf_time,
+            "real_time_factor_rtf": rtf,
+            "speedup": f"{speedup}x",
+        },
     }
     if "flushed_windows" in decoder_output:
         out["flushed_windows"] = decoder_output["flushed_windows"]
+        out["metrics"]["flushed_windows"] = decoder_output["flushed_windows"]
     if "decode_path" in decoder_output:
         out["decode_path"] = decoder_output["decode_path"]
-    if "phases" in decoder_output:
-        out["phases"] = decoder_output["phases"]
+    if phases:
+        out["phases"] = phases
     # Observability for the language lock (cheap, no PII beyond transcript).
     if clean_enabled and transcript != raw_transcript:
         out["transcript_raw"] = raw_transcript

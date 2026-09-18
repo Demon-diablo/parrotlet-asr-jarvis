@@ -216,18 +216,25 @@ def trim_audio_silence(
 # ---------------------------------------------------------------------------
 # Public loader
 # ---------------------------------------------------------------------------
-def load_audio_for_inference(validated: Dict[str, Any]) -> Tuple["numpy.ndarray", int, int]:
+def load_audio_for_inference(
+    validated: Dict[str, Any],
+    return_details: bool = False,
+) -> Any:
     """Load + resample + mono-mix the audio for one validated payload.
 
-    Returns ``(audio_16k_mono, original_sample_rate, total_16k_samples)``.
+    When ``return_details`` is False (default):
+        Returns ``(audio_16k_mono, original_sample_rate, total_16k_samples)``.
+    When ``return_details`` is True:
+        Returns ``(audio_16k_mono, original_sample_rate, total_16k_samples, details_dict)``.
 
     ``audio_16k_mono`` is always ``float32`` shape ``(n,)`` at 16 kHz. Any
     input format (wav / flac / ogg / mp3 / arbitrary sample rate / mono /
-    multi-channel) is handled uniformly. The returned ``audio_seconds`` can
-    be computed as ``len(audio_16k_mono) / 16000``.
+    multi-channel) is handled uniformly.
     """
+    import time
     kind = validated["kind"]
 
+    t0 = time.perf_counter()
     if kind == "audio_bytes":
         raw: bytes = validated["audio_bytes"]
         audio_np, sr, channels_first = _decode_bytes_to_numpy(raw)
@@ -243,10 +250,53 @@ def load_audio_for_inference(validated: Dict[str, Any]) -> Tuple["numpy.ndarray"
     else:
         raise ValueError(f"unsupported audio kind: {kind}")
 
+    t_read = time.perf_counter()
+
+    # Determine original channels and samples before mono conversion
+    if audio_np.ndim == 1:
+        orig_channels = 1
+        orig_samples = int(audio_np.shape[0])
+    elif audio_np.ndim == 2:
+        if channels_first:
+            orig_channels = int(audio_np.shape[0])
+            orig_samples = int(audio_np.shape[1])
+        else:
+            orig_channels = int(audio_np.shape[1])
+            orig_samples = int(audio_np.shape[0])
+    else:
+        orig_channels = 1
+        orig_samples = int(audio_np.size)
+
     mono = _to_mono(audio_np, channels_first)
+    t_mono = time.perf_counter()
+
     audio_16k = _resample_to_16k(mono, sr, TARGET_SAMPLE_RATE)
+    t_resample = time.perf_counter()
+
+    trimmed = False
     if len(audio_16k) > 0 and bool(validated.get("trim_silence", False)):
         audio_16k = trim_audio_silence(audio_16k, top_db=35.0, margin_samples=3200)
+        trimmed = True
+    t_trim = time.perf_counter()
+
+    details = {
+        "original_sample_rate": int(sr),
+        "target_sample_rate": TARGET_SAMPLE_RATE,
+        "is_resampled_to_16k": bool(int(sr) != TARGET_SAMPLE_RATE),
+        "original_channels": orig_channels,
+        "original_samples": orig_samples,
+        "total_16k_samples": int(audio_16k.shape[0]),
+        "duration_seconds": round(float(audio_16k.shape[0]) / TARGET_SAMPLE_RATE, 4),
+        "phases": {
+            "decode_audio_s": round(t_read - t0, 4),
+            "mono_mix_s": round(t_mono - t_read, 4),
+            "resample_16k_s": round(t_resample - t_mono, 4),
+            "silence_trim_s": round(t_trim - t_resample, 4) if trimmed else 0.0,
+        },
+    }
+
+    if return_details:
+        return audio_16k, int(sr), int(audio_16k.shape[0]), details
     return audio_16k, int(sr), int(audio_16k.shape[0])
 
 
