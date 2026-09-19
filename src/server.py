@@ -393,10 +393,10 @@ class ParrotletWorker:
     ) -> dict:
         from src.config import get_settings
         from src.extractor import extract_prescriptions
-        from src.schema import STANDARD_SYSTEM_PROMPT
+        from src.schema import get_default_system_prompt
 
         settings = get_settings()
-        sys_prompt = system_prompt if system_prompt is not None else STANDARD_SYSTEM_PROMPT
+        sys_prompt = system_prompt if system_prompt is not None else get_default_system_prompt()
         temp = temperature if temperature is not None else settings.extractor_temperature
         max_tok = max_tokens if max_tokens is not None else settings.extractor_max_tokens
 
@@ -425,10 +425,10 @@ class ParrotletWorker:
     ):
         from src.config import get_settings
         from src.extractor import extract_prescriptions_stream
-        from src.schema import STANDARD_SYSTEM_PROMPT
+        from src.schema import get_default_system_prompt
 
         settings = get_settings()
-        sys_prompt = system_prompt if system_prompt is not None else STANDARD_SYSTEM_PROMPT
+        sys_prompt = system_prompt if system_prompt is not None else get_default_system_prompt()
         temp = temperature if temperature is not None else settings.extractor_temperature
         max_tok = max_tokens if max_tokens is not None else settings.extractor_max_tokens
 
