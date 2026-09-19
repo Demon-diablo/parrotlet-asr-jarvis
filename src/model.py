@@ -325,6 +325,48 @@ def _submodule_device(module: Any) -> Optional[str]:
         return None
 
 
+def _patch_gemma3_inputs_embeds() -> None:
+    """Patch Gemma3ForConditionalGeneration to support inputs_embeds in generate().
+
+    In modern transformers (4.49+ / 5.x), GenerationMixin validates that
+    prepare_inputs_for_generation explicitly has 'inputs_embeds' in its signature.
+    Gemma3ForConditionalGeneration implemented it with **kwargs, omitting
+    'inputs_embeds' from the explicit parameters, causing .generate(inputs_embeds=...)
+    to falsely raise ValueError.
+    """
+    try:
+        from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
+        import inspect
+        sig = inspect.signature(Gemma3ForConditionalGeneration.prepare_inputs_for_generation)
+        if "inputs_embeds" not in sig.parameters:
+            orig_prep = Gemma3ForConditionalGeneration.prepare_inputs_for_generation
+
+            def _patched_prepare_inputs_for_generation(
+                self,
+                input_ids=None,
+                inputs_embeds=None,
+                use_cache=True,
+                is_first_iteration=False,
+                **kwargs,
+            ):
+                model_inputs = orig_prep(
+                    self,
+                    input_ids=input_ids,
+                    inputs_embeds=inputs_embeds,
+                    use_cache=use_cache,
+                    is_first_iteration=is_first_iteration,
+                    **kwargs,
+                )
+                if not (is_first_iteration or not use_cache):
+                    model_inputs["token_type_ids"] = None
+                return model_inputs
+
+            Gemma3ForConditionalGeneration.prepare_inputs_for_generation = _patched_prepare_inputs_for_generation
+            log.info("Patched Gemma3ForConditionalGeneration.prepare_inputs_for_generation for inputs_embeds")
+    except Exception as exc:
+        log.debug("Gemma3 inputs_embeds patch skipped: %s", exc)
+
+
 # ---------------------------------------------------------------------------
 # Real loaders (Phase 3).
 # ---------------------------------------------------------------------------
@@ -336,6 +378,7 @@ def _import_custom_classes(speech_llm_cls: Any, speech_llm_config_cls: Any) -> N
     ``__main__``-only branch; we run them unconditionally because the same
     module is imported via ``trust_remote_code=True``.
     """
+    _patch_gemma3_inputs_embeds()
     try:
         from transformers import AutoConfig, AutoModel  # type: ignore
 
@@ -611,6 +654,7 @@ def load_model(force_reload: bool = False) -> LoadedModel:
     Thread-safe so concurrent Serverless jobs can't double-load. ``force_reload``
     bypasses the cache (tests + manual config changes).
     """
+    _patch_gemma3_inputs_embeds()
     lock = _CACHE["lock"]
     with lock:
         if _CACHE["loaded"] and not force_reload:

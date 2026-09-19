@@ -604,18 +604,17 @@ def _transcribe_one(
     settings: Settings,
     bad_words: Optional[List[List[int]]] = None,
 ) -> tuple:
-    """Transcribe a single 16 kHz audio window using SpeechLLM.transcribe.
+    """Transcribe a single 16 kHz audio window using batched single-window runner or SpeechLLM.transcribe."""
+    try:
+        results = _transcribe_batched(
+            speech_llm, [window_audio], settings, bad_words=bad_words
+        )
+        return (results[0] if results else "", bool(bad_words))
+    except Exception as exc:
+        log.debug("_transcribe_batched single-window fallback failed: %s; falling back to SpeechLLM.transcribe", exc)
 
-    NOTE: this rarely-hit fallback path (only reached when _transcribe_batched
-    raises) calls into the upstream wrapper's own generate() call, which we
-    don't control here — if it ever shows the same full-max_new_tokens
-    symptom as the batched path did, the fix has to happen in the upstream
-    ``SpeechLLM.transcribe`` implementation, not in this file.
-    """
     base_kwargs: Dict[str, Any] = {
         "max_new_tokens": settings.max_new_tokens,
-        # repetition_penalty=1.2 matches upstream defaults.
-        # do_sample=False pins upstream greedy default explicitly.
         "do_sample": False,
     }
     if bad_words:
