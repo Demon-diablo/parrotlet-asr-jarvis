@@ -74,6 +74,13 @@ def build_app(worker_cls=None):
         except Exception as exc:  # non-fatal; ban resolves lazily
             print(f"[serve_jarvis] banned-ids prewarm skipped: {exc}", flush=True)
 
+        # 4. Pre-warm zero-hop clinical extractor prefix cache
+        try:
+            from src.extractor import warmup_extractor
+            warmup_extractor()
+        except Exception as exc:
+            print(f"[serve_jarvis] extractor prewarm skipped: {exc}", flush=True)
+
         if _prev_lifespan is not None:
             async with _prev_lifespan(api):
                 yield

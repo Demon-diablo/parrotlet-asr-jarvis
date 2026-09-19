@@ -155,6 +155,35 @@ def print_report(res_json, elapsed_total, audio_path):
     print("\n[5] TRANSCRIPTION")
     print("─" * 78)
     print(f'"{transcript}"')
+
+    extraction = out.get("extraction")
+    if isinstance(extraction, dict):
+        ext_lat = extraction.get("latency_seconds", 0.0)
+        ext_tok = extraction.get("tokens_generated", 0)
+        ext_tok_s = extraction.get("throughput_tok_s", 0.0)
+        meds = extraction.get("medications", [])
+        med_cnt = extraction.get("medications_count", len(meds))
+        val_json = extraction.get("valid_json", False)
+
+        print("\n[6] ZERO-HOP MEDGEMMA CLINICAL EXTRACTION")
+        print("─" * 78)
+        print(f" • Extractor Engine      : vLLM (Prefix Cached)")
+        print(f" • Extraction Latency    : {ext_lat:.4f}s")
+        print(f" • Extractor Throughput  : {ext_tok_s:.1f} tokens/second ({ext_tok} tokens)")
+        print(f" • Medications Extracted : {med_cnt} items")
+        print(f" • JSON Syntax Valid     : {val_json}")
+        print("\n[7] STRUCTURED CLINICAL MEDICATIONS JSON OUTPUT")
+        print("─" * 78)
+        print(json.dumps({"medications": meds}, indent=2, ensure_ascii=False))
+
+    print("\n[8] TOTAL PIPELINE RTT")
+    print("─" * 78)
+    asr_lat = out.get("asr_latency_seconds", inf_s)
+    tot_lat = out.get("total_latency_seconds", elapsed_total)
+    print(f" • ASR Pure Latency      : {asr_lat:.4f}s")
+    if isinstance(extraction, dict):
+        print(f" • Extractor Latency     : {extraction.get('latency_seconds', 0.0):.4f}s")
+    print(f" • Total Round-Trip Time : {elapsed_total:.4f}s")
     print("=" * 78 + "\n")
 
 
@@ -163,6 +192,8 @@ def main():
     ap.add_argument("audio", nargs="?", default=os.getenv("TEST_AUDIO", AUDIO))
     ap.add_argument("--url", default=os.getenv("URL", URL))
     ap.add_argument("--token", default=os.getenv("AUTH_TOKEN") or os.getenv("MODAL_AUTH_TOKEN", ""))
+    ap.add_argument("--pipeline", action="store_true", default=True, help="Test full zero-hop /pipeline endpoint.")
+    ap.add_argument("--transcribe-only", dest="pipeline", action="store_false", help="Test /transcribe only.")
     ap.add_argument("--raw", action="store_true", help="Print raw JSON response.")
     a = ap.parse_args()
 
@@ -176,7 +207,8 @@ def main():
 
     token = a.token or ""
     H = {"Authorization": f"Bearer {token}"} if token else {}
-    print(f"Target URL   : {base}\nAudio File   : {a.audio}")
+    endpoint = "/pipeline" if a.pipeline else "/transcribe"
+    print(f"Target URL   : {base}{endpoint}\nAudio File   : {a.audio}")
 
     # Health check
     s, b = req("GET", base + "/health", headers=H, timeout=300)
@@ -196,7 +228,9 @@ def main():
     body = (
         b"--"
         + bound
-        + b'\r\nContent-Disposition: form-data; name="file"; filename="audio.wav"\r\nContent-Type: audio/wav\r\n\r\n'
+        + b'\r\nContent-Disposition: form-data; name="file"; filename="'
+        + Path(a.audio).name.encode()
+        + b'"\r\nContent-Type: audio/ogg\r\n\r\n'
         + data
         + b"\r\n--"
         + bound
@@ -206,14 +240,14 @@ def main():
     t0 = time.time()
     s, out = req(
         "POST",
-        base + "/transcribe",
+        base + endpoint,
         body=body,
         headers={**H, "Content-Type": "multipart/form-data; boundary=" + bound.decode()},
     )
     elapsed_total = time.time() - t0
 
     if s != 200:
-        print(f"\n[/transcribe failed with HTTP {s} in {elapsed_total:.2f}s]\n{out[:2000]}")
+        print(f"\n[{endpoint} failed with HTTP {s} in {elapsed_total:.2f}s]\n{out[:2000]}")
         sys.exit(1)
 
     try:
@@ -221,9 +255,18 @@ def main():
         if a.raw:
             print("\n[Raw JSON Response]")
             print(json.dumps(j, indent=2, ensure_ascii=False))
-        print_report(j, elapsed_total, a.audio)
+        # Handle envelope format if wrapped
+        payload = j
+        if isinstance(j, dict) and "output" in j and "asr_output" in j["output"]:
+            # Combine asr_output and top-level fields for reporting
+            merged = dict(j["output"]["asr_output"])
+            merged["extraction"] = j["output"].get("extraction")
+            merged["asr_latency_seconds"] = j["output"].get("asr_latency_seconds")
+            merged["total_latency_seconds"] = j["output"].get("total_latency_seconds")
+            payload = {"status": "success", "output": merged}
+        print_report(payload, elapsed_total, a.audio)
     except Exception as exc:
-        print(f"\n[/transcribe returned non-JSON: {exc}]")
+        print(f"\n[{endpoint} returned non-JSON: {exc}]")
         print(out[:4000])
 
 
