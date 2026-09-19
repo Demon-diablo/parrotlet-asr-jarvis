@@ -97,7 +97,7 @@ def test_get_extractor_backend(monkeypatch):
     assert get_extractor_backend() == "none"
 
     monkeypatch.setenv("EXTRACTOR_BACKEND", "invalid_choice")
-    assert get_extractor_backend() == "vllm"
+    assert get_extractor_backend() == "sglang"
 
 
 def test_extract_prescriptions_backend_none(monkeypatch):
@@ -159,3 +159,62 @@ def test_extract_prescriptions_stream_mock():
         assert len(events) == 2
         assert events[0]["event"] == "extraction_start"
         assert events[1]["event"] == "extraction_complete"
+
+
+def test_extract_prescriptions_sglang_mock():
+    reset_extractor()
+    sample_json = json.dumps({
+        "medications": [
+            {
+                "spoken_name": "Pan 40",
+                "strength": "40mg",
+                "dosage_form": "tablet",
+                "frequency": "OD (daily)",
+            }
+        ]
+    })
+
+    mock_engine = MagicMock()
+    mock_engine.generate.return_value = {
+        "text": f"```json\n{sample_json}\n```",
+        "meta_info": {"completion_tokens": 15},
+    }
+
+    with patch("src.extractor.load_extractor", return_value=mock_engine):
+        with patch.dict("src.extractor._EXTRACTOR_CACHE", {"backend": "sglang", "engine": mock_engine, "loaded": True}):
+            res = extract_prescriptions("Prescribe Pan 40 OD")
+            assert res["valid_json"] is True
+            assert res["medications_count"] == 1
+            assert res["medications"][0]["spoken_name"] == "Pan 40"
+            assert res["tokens_generated"] == 15
+
+
+def test_extract_prescriptions_sglang_streaming_tokens():
+    reset_extractor()
+    sample_json = json.dumps({
+        "medications": [
+            {
+                "spoken_name": "Paracetamol",
+                "strength": "500mg",
+            }
+        ]
+    })
+    chunks = [
+        {"text": "```json\n{"},
+        {"text": f"```json\n{sample_json}"},
+        {"text": f"```json\n{sample_json}\n```"},
+    ]
+
+    mock_engine = MagicMock()
+    mock_engine.generate.return_value = iter(chunks)
+
+    with patch("src.extractor.load_extractor", return_value=mock_engine):
+        with patch.dict("src.extractor._EXTRACTOR_CACHE", {"backend": "sglang", "engine": mock_engine, "loaded": True}):
+            events = list(extract_prescriptions_stream("Paracetamol 500mg"))
+            event_types = [e["event"] for e in events]
+            assert "extraction_start" in event_types
+            assert "token" in event_types
+            assert "extraction_complete" in event_types
+            complete_evt = next(e for e in events if e["event"] == "extraction_complete")
+            assert complete_evt["valid_json"] is True
+            assert complete_evt["medications"][0]["spoken_name"] == "Paracetamol"

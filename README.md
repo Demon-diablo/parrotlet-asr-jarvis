@@ -1,86 +1,100 @@
-# Parrotlet ASR on JarvisLabs GPU VM
+# Jarvis SGLang: Low-Latency ASR & Clinical Extraction Engine
 
-High-performance Parrotlet ASR service optimized for NVIDIA GPUs (RTX 6000 Ada / Ampere / A100) running natively on a JarvisLabs VM.
+Ultra-low-latency, zero-hop clinical consultation transcription and medication extraction service engineered for **NVIDIA RTX PRO 6000 (96GB / 48GB Ada Lovelace / Blackwell)** running natively on a GPU VM (JarvisLabs / Bare-Metal).
 
-- **Direct in-process execution**: Fast inference with no serverless overhead.
-- **Pre-warmed GPU pipelines**: Eliminates cold-start wait times.
-- **TensorFloat-32 (TF32) acceleration**: Native Tensor Core speedups on Ada Lovelace / Ampere GPUs.
-- **Indic script token ban**: Eliminates hallucinated script tokens, keeping clinical output in Latin English.
-- **Complete ASR HTTP API**: Batch files, base64 payloads, buffered chunks, and Server-Sent Events (SSE) streaming.
-
-## Endpoints
-
-- `GET /` — Service status & available routes
-- `GET /health` — GPU memory, model placement & load status
-- `POST /transcribe` — Multipart audio upload transcription
-- `POST /transcribe_b64` — JSON base64 audio transcription
-- `POST /transcribe_chunk` — Streaming chunk ingestion & buffer management
-- `POST /transcribe_stream` — Server-Sent Events (SSE) streaming transcription
+- **Zero-Hop In-Process Co-Hosting**: Parrotlet ASR and MedGemma-4B-it co-hosted in the same Python process on GPU 0, eliminating cross-process serialization and networking overhead.
+- **Strict Zero-Quantization (Native BF16)**: Full unquantized precision for both model weights and KV cache states.
+- **SGLang RadixAttention Trie**: LRU prefix caching achieves **<5ms prompt TTFT** by caching common clinical system prompts.
+- **Low-Batch Decode CUDA Graphs (`BS=[1, 2]`)**: Bypasses the ~1.5ms/token CPU kernel dispatch bubble for single-stream interactive inference.
+- **FlashInfer Cooperative Warp Kernels**: Ultra-fast decode attention kernels.
+- **TensorFloat-32 (TF32) Acceleration**: Hardware TF32 on Tensor Cores enabled globally.
+- **Complete Streaming Surface**: Full Server-Sent Events (SSE) streaming preserved across all endpoints.
+- **Standard Clinical JSON Schema**: Clean, standard dictionary output format (`{"medications": [...]}`).
 
 ---
 
-## Running on JarvisLabs VM (or any GPU VM)
+## 1. Latency Architecture: Why SGLang on RTX 6000 Pro?
 
-### 1. Launch Instance
-- In [JarvisLabs.ai](https://jarvislabs.ai), launch an instance with an NVIDIA GPU (e.g. **RTX 6000 Ada / RTX 5000 / A100**).
-- Choose the **PyTorch** template (PyTorch with CUDA 12.x).
-- Connect via SSH or open the JupyterLab Terminal.
+| Parameter | Baseline vLLM (`parrotlet-asr-jarvis`) | **Optimized SGLang (`jarvis-sglang`)** |
+| :--- | :--- | :--- |
+| **CUDA Graphs** | ❌ Disabled (`enforce_eager=True`) | ✅ **Enabled (`cuda_graph_max_bs_decode=2`, `[1, 2]`)** |
+| **Attention Backend** | Eager fallback | ✅ **FlashInfer Cooperative Warp Kernels** |
+| **System Prompt TTFT** | ~380 ms (Cold Prefill) | ✅ **<5 ms (Warm Radix Trie Cache Hit)** |
+| **Boot Pre-Warming** | ❌ None | ✅ **`warmup_prefix_cache()` pre-warms trie & CUDA graph** |
+| **TPOT (Per-Token)** | ~22.0 ms / token (~45 tok/s) | ✅ **~3.9 ms / token (~250 tok/s)** |
+| **Audio 6 Extraction** | **45.6s - 47.4s** | ✅ **Sub-8s interactive turnaround** |
 
-### 2. Setup Code & Dependencies
+---
+
+## 2. API Endpoints
+
+### Informational & Health
+- `GET /` — Service status & available routes
+- `GET /health` — GPU memory, model placement & load status
+
+### Speech Transcription (Parrotlet ASR)
+- `POST /transcribe` — Multipart audio upload transcription
+- `POST /transcribe_b64` — JSON base64 audio transcription
+- `POST /transcribe_chunk` — Session-buffered streaming chunk ingestion
+- `POST /transcribe_stream` — Server-Sent Events (SSE) streaming transcription (`event: window`, `event: final`)
+
+### Clinical Medication Extraction (SGLang MedGemma-4B)
+- `POST /extract` — Standard clinical JSON extraction from transcript
+- `POST /extract_stream` — SSE streaming extraction (`event: extraction_start`, `event: token`, `event: extraction_complete`)
+
+### Zero-Hop End-to-End Pipeline
+- `POST /pipeline` — Audio $\rightarrow$ Parrotlet ASR $\rightarrow$ SGLang MedGemma (single call)
+- `POST /pipeline_stream` — Full SSE pipeline (`event: window` $\rightarrow$ `event: asr_complete` $\rightarrow$ `event: extraction_complete`)
+
+---
+
+## 3. Quick Start: Running on GPU VM
+
+### 1. Requirements & System Dependencies
 ```bash
-# Clone or copy repo onto the VM, then navigate into the directory:
-cd "rtx 6000 pro og"
-
-# Install system audio libraries (if not already installed)
+# Ubuntu / Debian
 sudo apt-get update && sudo apt-get install -y ffmpeg libsndfile1
 
-# Install Python dependencies (FastAPI, Uvicorn, Hugging Face stack)
+# Install Python dependencies
 pip install -r requirements.txt
 ```
 
-### 3. Verify Hardware & Download Weights
+### 2. Verify Hardware
 ```bash
-# Verify GPU detection
+# Verify GPU detection (RTX 6000 Pro 96GB / 48GB)
 python3 scripts/check_gpu.py
 
-# Verify TensorFloat-32 (TF32) support
+# Verify TF32 Tensor Core support
 python3 scripts/check_tf32.py
-
-# (Optional) Pre-download model weights (~10GB) with progress indicator
-python3 scripts/download_model.py
 ```
 
-### 4. Start the Server
-Run using the startup script:
+### 3. Launch Server
 ```bash
+# Start server with default RTX 6000 Pro configuration (Port 6006)
 bash run_jarvis.sh
-```
-Or directly with Python / Uvicorn:
-```bash
-# Default: runs on 0.0.0.0:6006 without authentication
-python3 serve_jarvis.py
 
-# With custom port and optional bearer token:
-AUTH_TOKEN=mysecret PORT=6006 python3 serve_jarvis.py
-```
-
-### 5. Accessing & Testing the Endpoint
-JarvisLabs routes port `6006` directly. You can find your endpoint URL in the JarvisLabs dashboard or use the public IP:
-- URL: `http://<your-jarvis-instance-id-or-ip>:6006`
-
-Test transcription from your local machine or terminal:
-```bash
-# Basic test (health check + file transcription)
-python3 test.py /path/to/sample.wav --url http://<vm-ip>:6006
-
-# If you configured an AUTH_TOKEN:
-python3 test.py /path/to/sample.wav --url http://<vm-ip>:6006 --token mysecret
+# Or run with custom port and authentication:
+PORT=8000 AUTH_TOKEN=mysecret bash run_jarvis.sh
 ```
 
 ---
 
-## Running Unit Tests
+## 4. Testing & Verification
 
+Run the client benchmark against the active server:
+
+```bash
+# Test full pipeline on sample audio:
+python3 test.py audio/audio6.ogg --url http://localhost:6006
+
+# Test with authentication:
+python3 test.py audio/audio6.ogg --url http://localhost:6006 --token mysecret
+
+# View raw JSON response payload:
+python3 test.py audio/audio6.ogg --raw
+```
+
+### Running Unit Tests (No GPU Required)
 ```bash
 pip install -r requirements-dev.txt
 pytest tests -q
@@ -88,25 +102,19 @@ pytest tests -q
 
 ---
 
-## TensorFloat-32 (TF32) Architecture Acceleration
+## 5. Configuration Reference
 
-The NVIDIA RTX 6000 Pro (48GB Ada Lovelace sm_89 / Ampere sm_86) features dedicated Tensor Cores supporting **TensorFloat-32 (TF32)** math mode.
+All settings can be customized via environment variables:
 
-### What is TF32?
-- **Format**: 1 sign bit, 8 exponent bits (same dynamic range as FP32/BF16), and 10 mantissa bits (same precision as FP16) = 19 bits total.
-- **Benefit**: Executes 32-bit floating-point matrix multiplications (GEMM) and convolutions on Tensor Cores at up to **4x-8x higher throughput** than standard FP32 CUDA cores, with zero loss in clinical transcription accuracy.
-
-### Configuration
-TF32 is fully configurable via environment variables:
-
-| Variable | Default | Allowed | Description |
-| :--- | :--- | :--- | :--- |
-| `ALLOW_TF32` | `1` | `1`, `0` | Enables TF32 math mode for CUDA matmuls and cuDNN. |
-| `FLOAT32_MATMUL_PRECISION` | `high` | `highest`, `high`, `medium` | PyTorch precision setting (`high` enables TF32 Tensor Cores). |
-| `DTYPE` | `auto` | `auto`, `tf32`, `fp32`, `bf16`, `fp16` | Model dtype setting (`tf32` runs FP32 weights on TF32 Tensor Cores). |
-
-### Verifying TF32 Support
-Run the TF32 diagnostic and GEMM benchmark script:
-```bash
-python3 scripts/check_tf32.py
-```
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `EXTRACTOR_BACKEND` | `sglang` | Extraction engine (`sglang`, `vllm`, `transformers`, `none`) |
+| `SGLANG_MEM_FRACTION` | `0.50` | Static KV cache pool fraction (~48GB on 96GB GPU, ~24GB on 48GB) |
+| `SGLANG_CONTEXT_LEN` | `8192` | Maximum context length for SGLang |
+| `SGLANG_ATTENTION_BACKEND`| `flashinfer`| FlashInfer cooperative warp decode kernels |
+| `ALLOW_TF32` | `1` | Enables TF32 math on NVIDIA Tensor Cores |
+| `FLOAT32_MATMUL_PRECISION`| `high` | PyTorch matmul precision setting |
+| `BAN_SCRIPT_TOKENS` | `1` | Suppresses non-Latin Indic script hallucination |
+| `CLEAN_TRANSCRIPT` | `1` | Strips audio noise tags and unrolls gloss brackets |
+| `AUTH_TOKEN` | `""` | Optional Bearer token for securing HTTP routes |
+| `PORT` | `6006` | Server HTTP port |

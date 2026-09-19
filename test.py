@@ -167,7 +167,7 @@ def print_report(res_json, elapsed_total, audio_path):
 
         print("\n[6] ZERO-HOP MEDGEMMA CLINICAL EXTRACTION")
         print("─" * 78)
-        print(f" • Extractor Engine      : vLLM (Prefix Cached)")
+        print(f" • Extractor Engine      : SGLang (RadixAttention & FlashInfer)")
         print(f" • Extraction Latency    : {ext_lat:.4f}s")
         print(f" • Extractor Throughput  : {ext_tok_s:.1f} tokens/second ({ext_tok} tokens)")
         print(f" • Medications Extracted : {med_cnt} items")

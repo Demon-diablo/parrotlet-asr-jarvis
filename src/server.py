@@ -471,8 +471,16 @@ class ParrotletWorker:
             temperature=temperature,
             max_tokens=max_tokens,
         )
-        if ext_res.get("status") == "error":
-            return ext_res
+        extraction_data = ext_res.get("output") if ext_res.get("status") == "success" else {
+            "valid_json": False,
+            "medications": [],
+            "medications_count": 0,
+            "latency_seconds": 0.0,
+            "tokens_generated": 0,
+            "throughput_tok_s": 0.0,
+            "raw_text": "",
+            "error": ext_res.get("error", "Extraction error"),
+        }
 
         total_latency = round(time.perf_counter() - t0, 3)
         return {
@@ -480,7 +488,7 @@ class ParrotletWorker:
             "output": {
                 "transcript": transcript,
                 "asr_output": asr_res.get("output", {}),
-                "extraction": ext_res.get("output", {}),
+                "extraction": extraction_data,
                 "asr_latency_seconds": asr_latency,
                 "total_latency_seconds": total_latency,
             },

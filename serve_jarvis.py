@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Serve Parrotlet ASR on a JarvisLabs GPU VM (or any Linux GPU server).
+"""Serve Parrotlet ASR + SGLang MedGemma on a JarvisLabs GPU VM (or any Linux GPU server).
 
 Runs FastAPI + Uvicorn with in-process GPU inference:
-- HTTP routes, auth, validation mapping
-- ParrotletWorker: inference, session buffering, SSE streaming
+- Parrotlet ASR (Whisper encoder + Llama/Gemma language model + multimodal projector)
+- SGLang MedGemma-4B-it engine with RadixAttention prefix caching and low-batch CUDA graphs
+- Zero-hop in-process execution with native BF16 unquantized weights
+- Session buffering, window slicing, and Server-Sent Events (SSE) streaming
 
 Run on the VM::
 
@@ -26,9 +28,18 @@ import sys
 import time
 from contextlib import asynccontextmanager
 
-# Blackwell SM 12.0 / FlashInfer compatibility defaults
-os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
-os.environ.setdefault("FLASHINFER_CUDA_ARCH_LIST", "9.0")
+try:
+    import nest_asyncio
+    nest_asyncio.apply()
+except Exception:
+    pass
+
+# If FLASHINFER_CUDA_ARCH_LIST contains multiple semicolon-separated architectures,
+# FlashInfer fails with "ValueError: too many values to unpack (expected 2)".
+# Allow FlashInfer to auto-detect hardware capability (e.g. SM 12.0 on Blackwell)
+if "FLASHINFER_CUDA_ARCH_LIST" in os.environ and ";" in os.environ["FLASHINFER_CUDA_ARCH_LIST"]:
+    del os.environ["FLASHINFER_CUDA_ARCH_LIST"]
+
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -49,7 +60,7 @@ def build_app(worker_cls=None):
         from src.gpu import configure_tf32, gpu_info
         from src.model import ensure_banned_ids, load_model
 
-        # 1. TF32 acceleration for RTX 6000 Ada / Ampere GPUs
+        # 1. TF32 acceleration for RTX 6000 Pro / Ampere / Ada / Blackwell GPUs
         try:
             settings = get_settings()
             tf32_status = configure_tf32(
@@ -60,13 +71,13 @@ def build_app(worker_cls=None):
         except Exception as exc:
             print(f"[serve_jarvis] TF32 init warning: {exc}", flush=True)
 
-        # 2. Warm the model at startup so the first request isn't paying load time
+        # 2. Pre-warm Parrotlet ASR model on GPU
         t0 = time.perf_counter()
-        print("[serve_jarvis] Pre-warming Parrotlet model on GPU...", flush=True)
+        print("[serve_jarvis] Pre-warming Parrotlet ASR model on GPU...", flush=True)
         bundle = load_model()
         gpus = [g.get("name") for g in gpu_info().get("gpus", [])]
         print(
-            f"[serve_jarvis] Model ready in {time.perf_counter() - t0:.1f}s | "
+            f"[serve_jarvis] Parrotlet ASR ready in {time.perf_counter() - t0:.1f}s | "
             f"placement={(getattr(bundle, 'metadata', None) or {}).get('placement')} | "
             f"gpus={gpus}",
             flush=True,
@@ -75,15 +86,15 @@ def build_app(worker_cls=None):
         # 3. Pre-warm banned Indic token IDs
         try:
             ensure_banned_ids()
-        except Exception as exc:  # non-fatal; ban resolves lazily
+        except Exception as exc:
             print(f"[serve_jarvis] banned-ids prewarm skipped: {exc}", flush=True)
 
-        # 4. Pre-warm zero-hop clinical extractor prefix cache
+        # 4. Pre-warm SGLang RadixAttention prefix cache and decode CUDA graphs
         try:
-            from src.extractor import warmup_extractor
-            warmup_extractor()
+            from src.extractor import warmup_prefix_cache
+            warmup_prefix_cache()
         except Exception as exc:
-            print(f"[serve_jarvis] extractor prewarm skipped: {exc}", flush=True)
+            print(f"[serve_jarvis] SGLang extractor prewarm skipped: {exc}", flush=True)
 
         if _prev_lifespan is not None:
             async with _prev_lifespan(api):
@@ -101,7 +112,7 @@ app = build_app()
 if __name__ == "__main__":
     import uvicorn
 
-    parser = argparse.ArgumentParser(description="Serve Parrotlet ASR on JarvisLabs VM.")
+    parser = argparse.ArgumentParser(description="Serve Parrotlet ASR + SGLang on JarvisLabs VM.")
     parser.add_argument(
         "--host",
         default=os.getenv("HOST", "0.0.0.0"),
@@ -126,14 +137,17 @@ if __name__ == "__main__":
     configured_token = os.getenv("AUTH_TOKEN") or os.getenv("MODAL_AUTH_TOKEN")
     auth_status = "ENABLED (Bearer token configured)" if configured_token else "DISABLED (Open endpoint)"
 
-    print("=" * 66, flush=True)
-    print("  Parrotlet ASR Service — JarvisLabs GPU VM", flush=True)
-    print("=" * 66, flush=True)
-    print(f"  Host:        http://{args.host}:{args.port}", flush=True)
-    print(f"  Auth:        {auth_status}", flush=True)
-    print(f"  Health URL:  http://{args.host}:{args.port}/health", flush=True)
-    print(f"  Transcribe:  http://{args.host}:{args.port}/transcribe", flush=True)
-    print("=" * 66, flush=True)
+    print("=" * 72, flush=True)
+    print("  Parrotlet ASR + SGLang MedGemma Service — RTX 6000 Pro (96GB / 48GB)", flush=True)
+    print("=" * 72, flush=True)
+    print(f"  Host:             http://{args.host}:{args.port}", flush=True)
+    print(f"  Auth:             {auth_status}", flush=True)
+    print(f"  Health URL:       http://{args.host}:{args.port}/health", flush=True)
+    print(f"  Transcribe:       http://{args.host}:{args.port}/transcribe", flush=True)
+    print(f"  Stream Transcribe:http://{args.host}:{args.port}/transcribe_stream", flush=True)
+    print(f"  Extract:          http://{args.host}:{args.port}/extract", flush=True)
+    print(f"  Pipeline Stream:  http://{args.host}:{args.port}/pipeline_stream", flush=True)
+    print("=" * 72, flush=True)
 
     uvicorn.run(
         "serve_jarvis:app",

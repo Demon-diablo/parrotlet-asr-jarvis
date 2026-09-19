@@ -1,16 +1,19 @@
-# Parrotlet-a 2.5 Pro ASR on JarvisLabs GPU VM (RTX 6000 Ada / Ampere)
+# Parrotlet ASR + SGLang MedGemma on RTX 6000 Pro (96GB / 48GB GPU)
 #
-# Pinned per the upstream ekacare/parrotlet-a-2.5-pro requirements.
-# PyTorch with CUDA is pre-installed in the JarvisLabs base image.
+# PyTorch with CUDA is expected in the VM base image (CUDA 12.x / 13.x).
 
 # Machine Learning & Hugging Face Stack
-transformers>=4.52.0,<5
-accelerate>=0.27.0
+transformers==5.12.1
+accelerate>=1.1.0
 safetensors>=0.4.0
-huggingface_hub>=0.23.0
-torchao>=0.11.0,<=0.13.0
+huggingface_hub>=1.10,<2
 
-# Audio I/O & Resampling (apt: ffmpeg libsndfile1)
+# SGLang Engine & Low-Latency Acceleration
+sglang>=0.5.19
+flashinfer>=0.2.0; platform_system == "Linux"
+xgrammar>=0.1.18
+
+# Audio Processing & Resampling (apt: ffmpeg libsndfile1)
 librosa>=0.10.2,<0.12
 soundfile>=0.12.1
 numpy>=1.26,<3
@@ -19,7 +22,7 @@ resampy>=0.4.3
 # Web Server (FastAPI + Uvicorn)
 fastapi==0.141.1
 pydantic==2.13.5
-python-multipart
+python-multipart>=0.0.9
 requests>=2.31
 uvicorn>=0.27.0
 httpx>=0.27.0

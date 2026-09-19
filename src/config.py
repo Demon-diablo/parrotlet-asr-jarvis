@@ -1,21 +1,13 @@
-"""Centralised runtime configuration for the Parrotlet ASR service.
+"""Centralised runtime configuration for the Jarvis SGLang ASR & Extraction service.
 
-All values are read from environment variables. Nothing in here should assume a
-particular GPU model, GPU count, or temporary development path. The same
-configuration layer is used by:
-
-- serve_jarvis.py / src/server.py (FastAPI service & worker)
-- scripts/check_gpu.py
-- scripts/check_model.py
-- scripts/benchmark.py
-- src/model.py
-- src/inference.py
+All values are read from environment variables.
+Supports NVIDIA RTX PRO 6000 (96GB / 48GB Ada Lovelace / Blackwell).
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -66,7 +58,7 @@ _ALLOWED_DEVICE_MAP = {"auto", "cuda", "cpu", "balanced", "sequential"}
 _ALLOWED_FP8_COMPILE_MODE = {"default", "reduce-overhead", "max-autotune"}
 _ALLOWED_FP8_CONFIG = {"dynamic", "weight_only"}
 _ALLOWED_FLOAT32_MATMUL_PRECISION = {"highest", "high", "medium"}
-_ALLOWED_EXTRACTOR_BACKEND = {"vllm", "sglang", "transformers", "none"}
+_ALLOWED_EXTRACTOR_BACKEND = {"sglang", "vllm", "transformers", "none"}
 
 
 @dataclass(frozen=True)
@@ -87,37 +79,34 @@ class Settings:
     model_cache_dir: str
     max_new_tokens: int
     temperature: Optional[float]
-    # Ban non-Latin Indic script tokens at the decoder (Devanagari, Telugu,
-    # Gujarati, etc.). WIN in Sept-2025 benchmark: bad_words_ids ban cut
-    # semWER 0.73->0.21 on meds-abx-gi; prompt-steering alone LOST.
+    # Ban non-Latin Indic script tokens at the decoder (Devanagari, Telugu, etc.)
     ban_script_tokens: bool = True
-    # Deterministic transcript cleaner: strip <noise tags>, unwrap [gloss]
-    # brackets, collapse whitespace. Runs in _postprocess, no model call.
+    # Deterministic transcript cleaner: strip <noise tags>, unwrap [gloss] brackets
     clean_transcript: bool = True
     # FP8 compilation configuration
     fp8_compile_mode: str = "default"
     fp8_config: str = "dynamic"
     # Latency optimizations:
-    # use_static_cache: Pre-allocates StaticCache to eliminate 5,000+ dynamic memory reallocations
-    # trim_silence: Strips leading/trailing silence to reduce window count and hallucination overhead
     use_static_cache: bool = True
     trim_silence: bool = False
     # TensorFloat-32 (TF32) architecture support on RTX 6000 Pro / Ampere+
-    # allow_tf32: Enables TF32 math mode for float32 matmuls and cuDNN on Tensor Cores
-    # float32_matmul_precision: PyTorch precision level ("highest" = FP32, "high" = TF32, "medium" = BF16/TF32)
     allow_tf32: bool = True
     float32_matmul_precision: str = "high"
     # Zero-hop MedGemma clinical extraction engine configuration
-    extractor_backend: str = "vllm"
+    extractor_backend: str = "sglang"
     medgemma_model_id: str = "google/medgemma-4b-it"
     extractor_max_tokens: int = 4096
     extractor_temperature: float = 0.0
+    # SGLang specific configuration (Optimized for 96GB / 48GB GPUs)
+    sglang_mem_fraction: float = 0.50
+    sglang_context_len: int = 8192
+    sglang_attention_backend: str = "flashinfer"
+    speculative_draft_path: str = ""
+    speculative_steps: int = 3
+    # vLLM fallback settings (if ever toggled)
     extractor_gpu_memory_utilization: float = 0.45
-    extractor_enforce_eager: bool = True
+    extractor_enforce_eager: bool = False
 
-    # ------------------------------------------------------------------ #
-    # Convenience derived values (not env-driven directly).
-    # ------------------------------------------------------------------ #
     @property
     def model_source(self) -> str:
         """Resolved model source identifier: local directory or HF repo id."""
@@ -155,19 +144,16 @@ class Settings:
             "medgemma_model_id": self.medgemma_model_id,
             "extractor_max_tokens": self.extractor_max_tokens,
             "extractor_temperature": self.extractor_temperature,
-            "extractor_gpu_memory_utilization": self.extractor_gpu_memory_utilization,
-            "extractor_enforce_eager": self.extractor_enforce_eager,
-            # hf_token intentionally excluded from logs
+            "sglang_mem_fraction": self.sglang_mem_fraction,
+            "sglang_context_len": self.sglang_context_len,
+            "sglang_attention_backend": self.sglang_attention_backend,
+            "speculative_draft_path": self.speculative_draft_path,
+            "speculative_steps": self.speculative_steps,
         }
 
 
 def load_settings(env: Optional[dict] = None) -> Settings:
-    """Build a :class:`Settings` snapshot.
-
-    ``env`` is an optional mapping used by tests to override ``os.environ``
-    without mutating the global environment. When ``env`` is ``None``, real
-    ``os.environ`` values are read.
-    """
+    """Build a :class:`Settings` snapshot."""
     get = (lambda k, d="": env.get(k, d)) if env is not None else _env_str
     get_int = (lambda k, d: int(env.get(k, d))) if env is not None else _env_int
     get_float = (
@@ -193,12 +179,11 @@ def load_settings(env: Optional[dict] = None) -> Settings:
     fp8_config = (get("FP8_CONFIG", "weight_only") or "weight_only").lower()
     allow_tf32 = _get_bool("ALLOW_TF32", True)
     float32_matmul_precision = (get("FLOAT32_MATMUL_PRECISION", "high") or "high").lower()
-    extractor_backend = (get("EXTRACTOR_BACKEND", "") or get("EXTRACTOR_ENGINE", "vllm") or "vllm").lower()
+    extractor_backend = (get("EXTRACTOR_BACKEND", "") or get("EXTRACTOR_ENGINE", "sglang") or "sglang").lower()
 
     if quantization not in _ALLOWED_QUANTIZATION:
         raise ValueError(
-            f"Invalid QUANTIZATION={quantization!r}; expected one of "
-            f"{sorted(_ALLOWED_QUANTIZATION)}"
+            f"Invalid QUANTIZATION={quantization!r}; expected one of {sorted(_ALLOWED_QUANTIZATION)}"
         )
     if dtype not in _ALLOWED_DTYPE:
         raise ValueError(
@@ -206,28 +191,23 @@ def load_settings(env: Optional[dict] = None) -> Settings:
         )
     if device_map_mode not in _ALLOWED_DEVICE_MAP:
         raise ValueError(
-            f"Invalid DEVICE_MAP_MODE={device_map_mode!r}; expected one of "
-            f"{sorted(_ALLOWED_DEVICE_MAP)}"
+            f"Invalid DEVICE_MAP_MODE={device_map_mode!r}; expected one of {sorted(_ALLOWED_DEVICE_MAP)}"
         )
     if fp8_compile_mode not in _ALLOWED_FP8_COMPILE_MODE:
         raise ValueError(
-            f"Invalid FP8_COMPILE_MODE={fp8_compile_mode!r}; expected one of "
-            f"{sorted(_ALLOWED_FP8_COMPILE_MODE)}"
+            f"Invalid FP8_COMPILE_MODE={fp8_compile_mode!r}; expected one of {sorted(_ALLOWED_FP8_COMPILE_MODE)}"
         )
     if fp8_config not in _ALLOWED_FP8_CONFIG:
         raise ValueError(
-            f"Invalid FP8_CONFIG={fp8_config!r}; expected one of "
-            f"{sorted(_ALLOWED_FP8_CONFIG)}"
+            f"Invalid FP8_CONFIG={fp8_config!r}; expected one of {sorted(_ALLOWED_FP8_CONFIG)}"
         )
     if float32_matmul_precision not in _ALLOWED_FLOAT32_MATMUL_PRECISION:
         raise ValueError(
-            f"Invalid FLOAT32_MATMUL_PRECISION={float32_matmul_precision!r}; expected one of "
-            f"{sorted(_ALLOWED_FLOAT32_MATMUL_PRECISION)}"
+            f"Invalid FLOAT32_MATMUL_PRECISION={float32_matmul_precision!r}; expected one of {sorted(_ALLOWED_FLOAT32_MATMUL_PRECISION)}"
         )
     if extractor_backend not in _ALLOWED_EXTRACTOR_BACKEND:
         raise ValueError(
-            f"Invalid EXTRACTOR_BACKEND={extractor_backend!r}; expected one of "
-            f"{sorted(_ALLOWED_EXTRACTOR_BACKEND)}"
+            f"Invalid EXTRACTOR_BACKEND={extractor_backend!r}; expected one of {sorted(_ALLOWED_EXTRACTOR_BACKEND)}"
         )
 
     return Settings(
@@ -253,12 +233,16 @@ def load_settings(env: Optional[dict] = None) -> Settings:
         medgemma_model_id=get("MEDGEMMA_MODEL_ID", "") or get("MEDGEMMA_ID", "google/medgemma-4b-it"),
         extractor_max_tokens=get_int("EXTRACTOR_MAX_TOKENS", 4096),
         extractor_temperature=get_float("EXTRACTOR_TEMPERATURE", 0.0) or 0.0,
+        sglang_mem_fraction=get_float("SGLANG_MEM_FRACTION", 0.50) or 0.50,
+        sglang_context_len=get_int("SGLANG_CONTEXT_LEN", 8192),
+        sglang_attention_backend=get("SGLANG_ATTENTION_BACKEND", "flashinfer") or "flashinfer",
+        speculative_draft_path=get("SPECULATIVE_DRAFT_PATH", ""),
+        speculative_steps=get_int("SPECULATIVE_STEPS", 3),
         extractor_gpu_memory_utilization=get_float("EXTRACTOR_GPU_MEMORY_UTILIZATION", 0.45) or 0.45,
-        extractor_enforce_eager=_get_bool("EXTRACTOR_ENFORCE_EAGER", True),
+        extractor_enforce_eager=_get_bool("EXTRACTOR_ENFORCE_EAGER", False),
     )
 
 
-# Module-level cache so callers can use get_settings() cheaply.
 _cached: Optional[Settings] = None
 
 

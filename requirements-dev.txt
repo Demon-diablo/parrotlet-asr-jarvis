@@ -1,15 +1,5 @@
-# Development / test dependencies.
-# Install via: pip install -r requirements-dev.txt
-pytest>=7.0
-
-# Audio preprocessing tests (src/audio.py imports these lazily).
-librosa>=0.10.2,<0.12
-soundfile>=0.12.1
-numpy>=1.26,<3
-
-# HTTP contract tests (no GPU required).
-fastapi==0.141.1
-pydantic==2.13.5
-python-multipart
-httpx
-uvicorn>=0.27.0
+-r requirements.txt
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+flake8>=7.0.0
+black>=24.0.0
