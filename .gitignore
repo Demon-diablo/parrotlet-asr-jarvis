@@ -18,6 +18,7 @@ htmlcov/
 # Secrets & Local Configs
 .env
 *.local
+*_results/
 
 # Audio files & datasets (allow in audio/ or samples/)
 *.wav

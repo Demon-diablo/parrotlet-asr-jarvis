@@ -61,6 +61,35 @@ class _FakeWorker:
         ]
     )
     health_impl = staticmethod(lambda: {"loaded": True, "metadata": {}, "gpu": {}})
+    extract_text_impl = staticmethod(
+        lambda transcript="", system_prompt=None, temperature=None, max_tokens=None: {
+            "status": "success",
+            "output": {"valid_json": True, "medications": [{"spoken_name": "Pan 40"}], "medications_count": 1},
+        }
+    )
+    extract_stream_text_impl = staticmethod(
+        lambda transcript="", system_prompt=None, temperature=None, max_tokens=None: [
+            {"event": "extraction_start", "transcript": transcript},
+            {"event": "extraction_complete", "valid_json": True, "medications": [{"spoken_name": "Pan 40"}]},
+        ]
+    )
+    pipeline_impl = staticmethod(
+        lambda raw, system_prompt=None, temperature=None, max_tokens=None: {
+            "status": "success",
+            "output": {
+                "transcript": "Pan 40 OD",
+                "extraction": {"valid_json": True, "medications": [{"spoken_name": "Pan 40"}]},
+            },
+        }
+    )
+    pipeline_stream_impl = staticmethod(
+        lambda raw, system_prompt=None, temperature=None, max_tokens=None: [
+            {"event": "window", "transcript": "Pan 40 OD"},
+            {"event": "final", "full_transcript": "Pan 40 OD"},
+            {"event": "asr_complete", "transcript": "Pan 40 OD"},
+            {"event": "extraction_complete", "medications": [{"spoken_name": "Pan 40"}]},
+        ]
+    )
 
     def __init__(self, *args, **kwargs):
         pass
@@ -80,6 +109,22 @@ class _FakeWorker:
     @property
     def transcribe_stream_bytes(self):
         return _FakeMethod(self.transcribe_stream_bytes_impl)
+
+    @property
+    def extract_text(self):
+        return _FakeMethod(self.extract_text_impl)
+
+    @property
+    def extract_stream_text(self):
+        return _FakeMethod(self.extract_stream_text_impl)
+
+    @property
+    def pipeline(self):
+        return _FakeMethod(self.pipeline_impl)
+
+    @property
+    def pipeline_stream(self):
+        return _FakeMethod(self.pipeline_stream_impl)
 
     @property
     def health(self):
@@ -219,3 +264,59 @@ def test_stream_uses_remote_generator(client):
     assert response.status_code == 200
     assert "event: window" in response.text
     assert "event: final" in response.text
+
+
+def test_index_includes_new_endpoints(client):
+    resp = client.get("/")
+    assert resp.status_code == 200
+    endpoints = resp.json()["endpoints"]
+    assert "POST /extract" in endpoints
+    assert "POST /extract_stream" in endpoints
+    assert "POST /pipeline" in endpoints
+    assert "POST /pipeline_stream" in endpoints
+
+
+def test_extract_endpoint(client):
+    resp = client.post("/extract", json={"transcript": "Pan 40 OD"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "success"
+    assert data["output"]["medications_count"] == 1
+
+
+def test_extract_empty_400(client):
+    resp = client.post("/extract", json={"transcript": ""})
+    assert resp.status_code == 400
+
+
+def test_extract_stream_endpoint(client):
+    resp = client.post("/extract_stream", json={"transcript": "Pan 40 OD"})
+    assert resp.status_code == 200
+    assert "event: extraction_start" in resp.text
+    assert "event: extraction_complete" in resp.text
+
+
+def test_pipeline_endpoint(client):
+    resp = client.post("/pipeline", files=_wav_upload())
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "success"
+    assert data["output"]["transcript"] == "Pan 40 OD"
+
+
+def test_pipeline_stream_endpoint(client):
+    resp = client.post("/pipeline_stream", files=_wav_upload())
+    assert resp.status_code == 200
+    assert "event: window" in resp.text
+    assert "event: asr_complete" in resp.text
+    assert "event: extraction_complete" in resp.text
+
+
+@pytest.mark.parametrize("path", ["/extract", "/extract_stream"])
+def test_extract_routes_require_auth(authed_client, path):
+    assert authed_client.post(path, json={"transcript": "test"}).status_code == 401
+
+
+@pytest.mark.parametrize("path", ["/pipeline", "/pipeline_stream"])
+def test_pipeline_routes_require_auth(authed_client, path):
+    assert authed_client.post(path, files=_wav_upload()).status_code == 401

@@ -116,6 +116,12 @@ class ParrotletWorker:
         except Exception as exc:
             print(f"[parrotlet] banned-ids prewarm skipped: {exc}", flush=True)
 
+        try:
+            from src.extractor import warmup_extractor
+            warmup_extractor()
+        except Exception as exc:
+            print(f"[parrotlet] extractor prewarm skipped: {exc}", flush=True)
+
     def _transcribe_dict_impl(self, input_data: dict) -> dict:
         from src.inference import InputValidationError, run_inference
         from src.model import is_loaded, load_model
@@ -378,6 +384,147 @@ class ParrotletWorker:
     def transcribe_stream_bytes(self):
         return _CallableMethod(self._transcribe_stream_bytes_impl, is_generator=True)
 
+    def _extract_text_impl(
+        self,
+        transcript: str,
+        system_prompt: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> dict:
+        from src.config import get_settings
+        from src.extractor import extract_prescriptions
+        from src.schema import STANDARD_SYSTEM_PROMPT
+
+        settings = get_settings()
+        sys_prompt = system_prompt if system_prompt is not None else STANDARD_SYSTEM_PROMPT
+        temp = temperature if temperature is not None else settings.extractor_temperature
+        max_tok = max_tokens if max_tokens is not None else settings.extractor_max_tokens
+
+        try:
+            res = extract_prescriptions(
+                transcript=transcript,
+                system_prompt=sys_prompt,
+                temperature=temp,
+                max_tokens=max_tok,
+            )
+            return {"status": "success", "output": res}
+        except Exception as exc:
+            msg = f"{type(exc).__name__}: {exc}"
+            return {"status": "error", "error": msg[:500], "error_kind": "extractor"}
+
+    @property
+    def extract_text(self):
+        return _CallableMethod(self._extract_text_impl)
+
+    def _extract_stream_text_impl(
+        self,
+        transcript: str,
+        system_prompt: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ):
+        from src.config import get_settings
+        from src.extractor import extract_prescriptions_stream
+        from src.schema import STANDARD_SYSTEM_PROMPT
+
+        settings = get_settings()
+        sys_prompt = system_prompt if system_prompt is not None else STANDARD_SYSTEM_PROMPT
+        temp = temperature if temperature is not None else settings.extractor_temperature
+        max_tok = max_tokens if max_tokens is not None else settings.extractor_max_tokens
+
+        try:
+            yield from extract_prescriptions_stream(
+                transcript=transcript,
+                system_prompt=sys_prompt,
+                temperature=temp,
+                max_tokens=max_tok,
+            )
+        except Exception as exc:
+            yield {
+                "event": "error",
+                "error": str(exc)[:500],
+                "status": "error",
+            }
+
+    @property
+    def extract_stream_text(self):
+        return _CallableMethod(self._extract_stream_text_impl, is_generator=True)
+
+    def _pipeline_impl(
+        self,
+        audio_bytes: bytes,
+        system_prompt: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> dict:
+        t0 = time.perf_counter()
+        asr_res = self._transcribe_dict_impl({"audio": audio_bytes})
+        if asr_res.get("status") == "error":
+            return asr_res
+
+        transcript = asr_res.get("output", {}).get("transcript", "")
+        asr_latency = round(time.perf_counter() - t0, 3)
+
+        ext_res = self._extract_text_impl(
+            transcript=transcript,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        if ext_res.get("status") == "error":
+            return ext_res
+
+        total_latency = round(time.perf_counter() - t0, 3)
+        return {
+            "status": "success",
+            "output": {
+                "transcript": transcript,
+                "asr_output": asr_res.get("output", {}),
+                "extraction": ext_res.get("output", {}),
+                "asr_latency_seconds": asr_latency,
+                "total_latency_seconds": total_latency,
+            },
+        }
+
+    @property
+    def pipeline(self):
+        return _CallableMethod(self._pipeline_impl)
+
+    def _pipeline_stream_impl(
+        self,
+        audio_bytes: bytes,
+        system_prompt: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ):
+        asr_parts = []
+        full_transcript = ""
+        for item in self._transcribe_stream_bytes_impl(audio_bytes):
+            if item.get("event") == "error":
+                yield item
+                return
+            yield item
+            if item.get("event") == "window":
+                asr_parts.append(item.get("transcript", ""))
+            elif item.get("event") == "final":
+                full_transcript = item.get("full_transcript", "")
+
+        transcript = full_transcript if full_transcript else " ".join(asr_parts)
+
+        yield {"event": "asr_complete", "transcript": transcript}
+
+        for item in self._extract_stream_text_impl(
+            transcript=transcript,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        ):
+            yield item
+
+    @property
+    def pipeline_stream(self):
+        return _CallableMethod(self._pipeline_stream_impl, is_generator=True)
+
     def _health_impl(self) -> dict:
         import traceback
 
@@ -441,6 +588,10 @@ def build_fastapi_app(worker_cls=None):
                 "POST /transcribe_b64",
                 "POST /transcribe_chunk",
                 "POST /transcribe_stream",
+                "POST /extract",
+                "POST /extract_stream",
+                "POST /pipeline",
+                "POST /pipeline_stream",
             ],
         }
 
@@ -521,6 +672,120 @@ def build_fastapi_app(worker_cls=None):
             w = _get_worker()
             gen_fn = getattr(w.transcribe_stream_bytes, "remote_gen", w.transcribe_stream_bytes)
             for item in gen_fn(raw):
+                if isinstance(item, dict):
+                    event_type = item.get("event", "message")
+                    yield f"event: {event_type}\ndata: {json.dumps(item)}\n\n"
+                elif isinstance(item, str):
+                    yield item if item.endswith("\n\n") else f"data: {item}\n\n"
+                else:
+                    yield f"data: {json.dumps(item)}\n\n"
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+    @api.post("/extract")
+    async def extract(payload: dict, _: None = Depends(check_auth)):
+        transcript = payload.get("transcript", "")
+        if not transcript or not transcript.strip():
+            raise HTTPException(status_code=400, detail="transcript cannot be empty")
+        system_prompt = payload.get("system_prompt")
+        temperature = payload.get("temperature")
+        max_tokens = payload.get("max_tokens")
+        try:
+            w = _get_worker()
+            fn = getattr(w.extract_text, "remote", w.extract_text)
+            result = await _call_worker(
+                fn,
+                transcript=transcript,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)[:500])
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)[:500])
+        return JSONResponse(raise_for_worker_result(result))
+
+    @api.post("/extract_stream")
+    async def extract_stream(payload: dict, _: None = Depends(check_auth)):
+        transcript = payload.get("transcript", "")
+        if not transcript or not transcript.strip():
+            raise HTTPException(status_code=400, detail="transcript cannot be empty")
+        system_prompt = payload.get("system_prompt")
+        temperature = payload.get("temperature")
+        max_tokens = payload.get("max_tokens")
+
+        def event_generator():
+            w = _get_worker()
+            gen_fn = getattr(w.extract_stream_text, "remote_gen", w.extract_stream_text)
+            for item in gen_fn(
+                transcript=transcript,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            ):
+                if isinstance(item, dict):
+                    event_type = item.get("event", "message")
+                    yield f"event: {event_type}\ndata: {json.dumps(item)}\n\n"
+                elif isinstance(item, str):
+                    yield item if item.endswith("\n\n") else f"data: {item}\n\n"
+                else:
+                    yield f"data: {json.dumps(item)}\n\n"
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+    @api.post("/pipeline")
+    async def pipeline(
+        file: UploadFile = File(...),
+        system_prompt: Optional[str] = Form(None),
+        temperature: Optional[float] = Form(None),
+        max_tokens: Optional[int] = Form(None),
+        _: None = Depends(check_auth),
+    ):
+        raw = await file.read()
+        if not raw:
+            raise HTTPException(status_code=400, detail="empty upload")
+        if len(raw) > 50 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="audio exceeds 50 MiB cap")
+        try:
+            w = _get_worker()
+            fn = getattr(w.pipeline, "remote", w.pipeline)
+            result = await _call_worker(
+                fn,
+                raw,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)[:500])
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)[:500])
+        return JSONResponse(raise_for_worker_result(result))
+
+    @api.post("/pipeline_stream")
+    async def pipeline_stream(
+        file: UploadFile = File(...),
+        system_prompt: Optional[str] = Form(None),
+        temperature: Optional[float] = Form(None),
+        max_tokens: Optional[int] = Form(None),
+        _: None = Depends(check_auth),
+    ):
+        raw = await file.read()
+        if not raw:
+            raise HTTPException(status_code=400, detail="empty upload")
+        if len(raw) > 50 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="audio exceeds 50 MiB cap")
+
+        def event_generator():
+            w = _get_worker()
+            gen_fn = getattr(w.pipeline_stream, "remote_gen", w.pipeline_stream)
+            for item in gen_fn(
+                raw,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            ):
                 if isinstance(item, dict):
                     event_type = item.get("event", "message")
                     yield f"event: {event_type}\ndata: {json.dumps(item)}\n\n"

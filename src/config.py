@@ -66,6 +66,7 @@ _ALLOWED_DEVICE_MAP = {"auto", "cuda", "cpu", "balanced", "sequential"}
 _ALLOWED_FP8_COMPILE_MODE = {"default", "reduce-overhead", "max-autotune"}
 _ALLOWED_FP8_CONFIG = {"dynamic", "weight_only"}
 _ALLOWED_FLOAT32_MATMUL_PRECISION = {"highest", "high", "medium"}
+_ALLOWED_EXTRACTOR_BACKEND = {"vllm", "sglang", "transformers", "none"}
 
 
 @dataclass(frozen=True)
@@ -106,6 +107,13 @@ class Settings:
     # float32_matmul_precision: PyTorch precision level ("highest" = FP32, "high" = TF32, "medium" = BF16/TF32)
     allow_tf32: bool = True
     float32_matmul_precision: str = "high"
+    # Zero-hop MedGemma clinical extraction engine configuration
+    extractor_backend: str = "vllm"
+    medgemma_model_id: str = "google/medgemma-4b-it"
+    extractor_max_tokens: int = 4096
+    extractor_temperature: float = 0.0
+    extractor_gpu_memory_utilization: float = 0.45
+    extractor_enforce_eager: bool = True
 
     # ------------------------------------------------------------------ #
     # Convenience derived values (not env-driven directly).
@@ -143,6 +151,12 @@ class Settings:
             "trim_silence": self.trim_silence,
             "allow_tf32": self.allow_tf32,
             "float32_matmul_precision": self.float32_matmul_precision,
+            "extractor_backend": self.extractor_backend,
+            "medgemma_model_id": self.medgemma_model_id,
+            "extractor_max_tokens": self.extractor_max_tokens,
+            "extractor_temperature": self.extractor_temperature,
+            "extractor_gpu_memory_utilization": self.extractor_gpu_memory_utilization,
+            "extractor_enforce_eager": self.extractor_enforce_eager,
             # hf_token intentionally excluded from logs
         }
 
@@ -179,6 +193,7 @@ def load_settings(env: Optional[dict] = None) -> Settings:
     fp8_config = (get("FP8_CONFIG", "weight_only") or "weight_only").lower()
     allow_tf32 = _get_bool("ALLOW_TF32", True)
     float32_matmul_precision = (get("FLOAT32_MATMUL_PRECISION", "high") or "high").lower()
+    extractor_backend = (get("EXTRACTOR_BACKEND", "") or get("EXTRACTOR_ENGINE", "vllm") or "vllm").lower()
 
     if quantization not in _ALLOWED_QUANTIZATION:
         raise ValueError(
@@ -209,6 +224,11 @@ def load_settings(env: Optional[dict] = None) -> Settings:
             f"Invalid FLOAT32_MATMUL_PRECISION={float32_matmul_precision!r}; expected one of "
             f"{sorted(_ALLOWED_FLOAT32_MATMUL_PRECISION)}"
         )
+    if extractor_backend not in _ALLOWED_EXTRACTOR_BACKEND:
+        raise ValueError(
+            f"Invalid EXTRACTOR_BACKEND={extractor_backend!r}; expected one of "
+            f"{sorted(_ALLOWED_EXTRACTOR_BACKEND)}"
+        )
 
     return Settings(
         model_id=get("MODEL_ID", "ekacare/parrotlet-a-2.5-pro"),
@@ -229,6 +249,12 @@ def load_settings(env: Optional[dict] = None) -> Settings:
         trim_silence=_get_bool("TRIM_SILENCE", False),
         allow_tf32=allow_tf32,
         float32_matmul_precision=float32_matmul_precision,
+        extractor_backend=extractor_backend,
+        medgemma_model_id=get("MEDGEMMA_MODEL_ID", "") or get("MEDGEMMA_ID", "google/medgemma-4b-it"),
+        extractor_max_tokens=get_int("EXTRACTOR_MAX_TOKENS", 4096),
+        extractor_temperature=get_float("EXTRACTOR_TEMPERATURE", 0.0) or 0.0,
+        extractor_gpu_memory_utilization=get_float("EXTRACTOR_GPU_MEMORY_UTILIZATION", 0.45) or 0.45,
+        extractor_enforce_eager=_get_bool("EXTRACTOR_ENFORCE_EAGER", True),
     )
 
 
