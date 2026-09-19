@@ -6,8 +6,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.schema import (
+    DENSE_SYSTEM_PROMPT,
     STANDARD_SYSTEM_PROMPT,
+    get_default_system_prompt,
     normalize_frequency,
+    parse_dense_to_prescriptions,
     parse_prescriptions_json,
     strip_fences,
 )
@@ -218,3 +221,42 @@ def test_extract_prescriptions_sglang_streaming_tokens():
             complete_evt = next(e for e in events if e["event"] == "extraction_complete")
             assert complete_evt["valid_json"] is True
             assert complete_evt["medications"][0]["spoken_name"] == "Paracetamol"
+
+
+def test_parse_dense_to_prescriptions():
+    raw = (
+        "Pan|40 mg|Tablet|OD||ES|5 days|empty stomach\n"
+        "Drotin MF||Tablet|BD||DF|5 days|with breakfast\n"
+        "Tablet Buscopan|10 mg||BD|||5 days|with breakfast"
+    )
+    transcript = "Tablet Pan 40 OD with empty stomach ES. Tablet Drotin MF BD five days with breakfast DF. Tablet Buscopan 10 mg BD five days."
+    meds = parse_dense_to_prescriptions(raw, transcript=transcript)
+    assert len(meds) == 3
+    assert meds[0]["spoken_name"] == "Pan"
+    assert meds[0]["strength"] == "40 mg"
+    assert meds[0]["dosage_form"] == "Tablet"
+    assert meds[0]["frequency"] == "ES"
+    assert meds[0]["duration"] == "5 days"
+    assert meds[0]["instructions"] == "empty stomach"
+    assert "Pan 40" in meds[0]["source_text"]
+
+    # Auto-detected dosage form from prefix
+    assert meds[2]["spoken_name"] == "Buscopan"
+    assert meds[2]["dosage_form"] == "Tablet"
+
+
+def test_parse_prescriptions_dense_fallback():
+    raw = "Pan|40 mg|Tablet|OD||ES|5 days|empty stomach"
+    res = parse_prescriptions_json(raw)
+    assert res["valid_json"] is True
+    assert res["medications_count"] == 1
+    assert res["medications"][0]["spoken_name"] == "Pan"
+
+
+def test_get_default_system_prompt(monkeypatch):
+    monkeypatch.setenv("EXTRACTOR_MODE", "dense")
+    assert get_default_system_prompt() == DENSE_SYSTEM_PROMPT
+
+    monkeypatch.setenv("EXTRACTOR_MODE", "json")
+    assert get_default_system_prompt() == STANDARD_SYSTEM_PROMPT
+

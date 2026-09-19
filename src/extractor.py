@@ -27,7 +27,9 @@ except Exception:
     pass
 
 from src.schema import (
+    DENSE_SYSTEM_PROMPT,
     STANDARD_SYSTEM_PROMPT,
+    get_default_system_prompt,
     parse_prescriptions_json,
     strip_fences,
 )
@@ -82,8 +84,10 @@ def reset_extractor() -> None:
         _EXTRACTOR_CACHE["warmed_up"] = False
 
 
-def _format_prompt(transcript: str, system_prompt: str = STANDARD_SYSTEM_PROMPT) -> str:
+def _format_prompt(transcript: str, system_prompt: Optional[str] = None) -> str:
     """Format input prompt with Gemma 3 turn markers for deterministic Radix prefix caching."""
+    if system_prompt is None:
+        system_prompt = get_default_system_prompt()
     return (
         f"<start_of_turn>user\n{system_prompt}\n\n{transcript}"
         f"<end_of_turn>\n<start_of_turn>model\n"
@@ -286,7 +290,7 @@ def warmup_prefix_cache() -> None:
         backend = _EXTRACTOR_CACHE.get("backend")
 
         if backend == "sglang" and engine is not None:
-            dummy_prompt = _format_prompt("Tablet Paracetamol 500 mg TDS for 3 days.", system_prompt=STANDARD_SYSTEM_PROMPT)
+            dummy_prompt = _format_prompt("Tablet Paracetamol 500 mg TDS for 3 days.", system_prompt=get_default_system_prompt())
             engine.generate(
                 dummy_prompt,
                 sampling_params={
@@ -379,7 +383,7 @@ def _engine_generate_stream(engine: Any, prompt: str, sampling_params: Dict[str,
 
 def extract_prescriptions(
     transcript: str,
-    system_prompt: str = STANDARD_SYSTEM_PROMPT,
+    system_prompt: Optional[str] = None,
     temperature: float = 0.0,
     max_tokens: int = 4096,
 ) -> Dict[str, Any]:
@@ -387,6 +391,8 @@ def extract_prescriptions(
 
     Preserves standard clinical JSON output without altering prompt or schema.
     """
+    if system_prompt is None:
+        system_prompt = get_default_system_prompt()
     if get_extractor_backend() == "none":
         return {
             "valid_json": False,
@@ -484,7 +490,7 @@ def extract_prescriptions(
     gen_s = round(time.perf_counter() - t0, 3)
     tok_s = round(tokens_generated / max(gen_s, 1e-6), 2)
 
-    parsed = parse_prescriptions_json(raw_text)
+    parsed = parse_prescriptions_json(raw_text, transcript=transcript)
     return {
         "valid_json": parsed["valid_json"],
         "medications": parsed["medications"],
@@ -498,11 +504,13 @@ def extract_prescriptions(
 
 def extract_prescriptions_stream(
     transcript: str,
-    system_prompt: str = STANDARD_SYSTEM_PROMPT,
+    system_prompt: Optional[str] = None,
     temperature: float = 0.0,
     max_tokens: int = 4096,
 ) -> Generator[Dict[str, Any], None, None]:
     """Stream SSE extraction events and tokens, maintaining existing client contracts."""
+    if system_prompt is None:
+        system_prompt = get_default_system_prompt()
     # 1. Yield start event
     yield {"event": "extraction_start", "transcript": transcript}
 
@@ -592,7 +600,7 @@ def extract_prescriptions_stream(
 
     gen_s = round(time.perf_counter() - t0, 3)
     tok_s = round(tokens_generated / max(gen_s, 1e-6), 2)
-    parsed = parse_prescriptions_json(raw_text)
+    parsed = parse_prescriptions_json(raw_text, transcript=transcript)
 
     # 3. Yield completion event matching exact contract
     yield {

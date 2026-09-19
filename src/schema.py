@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any, Dict, List, Optional
 
@@ -50,13 +51,35 @@ def normalize_frequency(freq: Optional[str]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Standard Production Clinical Extraction Prompt (Full JSON Schema)
+# Clinical Extraction Prompts
 # ---------------------------------------------------------------------------
 STANDARD_SYSTEM_PROMPT = (
     "Extract literal medication mentions from the doctor transcript. "
     'Return valid JSON only in this format: {"medications":[{"spoken_name":"","strength":"","dosage_form":"","dose":"","route":"","frequency":"","duration":"","instructions":"","source_text":""}]}. '
     "Do not prescribe or correct medicine spellings."
 )
+
+DENSE_SYSTEM_PROMPT = (
+    "Extract literal medication mentions from the doctor transcript. Do not prescribe or correct medicine spellings.\n"
+    "Output exactly ONE line per medication in this pipe-delimited format:\n"
+    "spoken_name|strength|dosage_form|dose|route|frequency|duration|instructions\n\n"
+    "Rules:\n"
+    "- Output ONLY the pipe-delimited lines. No markdown code fences, headers, or explanatory text.\n"
+    "- Do not include form words (Tablet, Capsule, Inhaler, Syrup) in spoken_name if dosage_form is specified.\n"
+    "- Leave omitted fields blank between pipes. Do not shift columns.\n"
+    "- Extract literal spoken mentions. Do not invent or correct medicine spellings.\n\n"
+    "Example output:\n"
+    "Pan|40 mg|Tablet|OD||ES|5 days|empty stomach\n"
+    "Drotin MF||Tablet|BD||DF|5 days|with breakfast\n"
+    "Foracort|200 mg|Inhaler|two puffs||twelve hourly||two puffs twelve hourly"
+)
+
+
+def get_default_system_prompt() -> str:
+    """Resolve default system prompt based on EXTRACTOR_MODE ('dense' vs 'json')."""
+    mode = (os.getenv("EXTRACTOR_MODE") or os.getenv("EXTRACTOR_PROMPT_MODE") or "dense").lower()
+    return STANDARD_SYSTEM_PROMPT if mode == "json" else DENSE_SYSTEM_PROMPT
+
 
 MEDICATION_JSON_SCHEMA = {
     "type": "object",
@@ -110,14 +133,88 @@ def strip_fences(text: str) -> str:
     return text
 
 
-def parse_prescriptions_json(raw_text: str) -> Dict[str, Any]:
-    """Parse raw LLM output text into structured clinical medications dictionary."""
+def parse_dense_to_prescriptions(raw_text: str, transcript: str = "") -> List[Dict[str, str]]:
+    """Parse pipe-delimited lines into canonical 9-key clinical prescription dicts."""
+    medications: List[Dict[str, str]] = []
+    if not raw_text:
+        return medications
+
+    cleaned = raw_text.strip()
+    if "```" in cleaned:
+        parts = cleaned.split("```")
+        pipe_parts = [p for p in parts if "|" in p]
+        cleaned = "\n".join(pipe_parts) if pipe_parts else parts[1 if len(parts) > 1 else 0]
+        if cleaned.startswith(("text", "csv", "markdown", "plaintext")):
+            cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned
+
+    for line in cleaned.strip().splitlines():
+        line = line.strip().strip("- ")
+        if not line or "|" not in line:
+            continue
+
+        cols = [c.strip() for c in line.split("|")]
+        if not cols or not cols[0]:
+            continue
+
+        spoken_name = cols[0]
+        strength = cols[1] if len(cols) > 1 else ""
+        dosage_form = cols[2] if len(cols) > 2 else ""
+        dose = cols[3] if len(cols) > 3 else ""
+        route = cols[4] if len(cols) > 4 else ""
+        frequency = cols[5] if len(cols) > 5 else ""
+        duration = cols[6] if len(cols) > 6 else ""
+        instructions = cols[7] if len(cols) > 7 else ""
+        source_text = cols[8] if len(cols) > 8 else ""
+
+        # Auto-detect dosage_form if not explicitly in col 2 but in spoken_name
+        if not dosage_form:
+            m = _FORM_PREFIX_RE.match(spoken_name)
+            if m:
+                dosage_form = m.group(0).strip().capitalize()
+                spoken_name = spoken_name[m.end():].strip()
+
+        # Reconstruct source_text snippet from transcript if missing
+        if not source_text and transcript:
+            idx = transcript.lower().find(spoken_name.lower())
+            if idx != -1:
+                start = max(0, transcript.rfind(".", 0, idx) + 1)
+                end = transcript.find(".", idx)
+                if end == -1:
+                    end = len(transcript)
+                source_text = transcript[start:end].strip()
+        if not source_text:
+            parts_str = [p for p in [dosage_form, spoken_name, strength, dose, route, frequency, duration, instructions] if p]
+            source_text = " ".join(parts_str)
+
+        medications.append({
+            "spoken_name": spoken_name,
+            "strength": strength,
+            "dosage_form": dosage_form,
+            "dose": dose,
+            "route": route,
+            "frequency": frequency,
+            "duration": duration,
+            "instructions": instructions,
+            "source_text": source_text,
+        })
+    return medications
+
+
+def parse_prescriptions_json(raw_text: str, transcript: str = "") -> Dict[str, Any]:
+    """Parse raw LLM output text into structured clinical medications dictionary.
+
+    Supports:
+    1. Standard JSON object with 'medications' key
+    2. Dense pipe-delimited format (name|dosage|form|...) auto-converted to 9-key schema
+    3. rx_norm and raw list formats
+    """
     clean = strip_fences(raw_text)
-    try:
-        parsed = json.loads(clean)
-    except Exception:
-        # Fallback to loose JSON regex or empty dict
-        parsed = None
+    parsed = None
+    if "{" in clean or "[" in clean:
+        try:
+            parsed = json.loads(clean)
+        except Exception:
+            parsed = None
 
     if isinstance(parsed, dict) and "medications" in parsed:
         medications = parsed["medications"]
@@ -140,6 +237,16 @@ def parse_prescriptions_json(raw_text: str) -> Dict[str, Any]:
     elif isinstance(parsed, list):
         medications = parsed
     else:
+        # Check if output is dense pipe-delimited format
+        if "|" in raw_text:
+            medications = parse_dense_to_prescriptions(raw_text, transcript=transcript)
+            if medications:
+                return {
+                    "valid_json": True,
+                    "medications": medications,
+                    "medications_count": len(medications),
+                    "raw_text": raw_text,
+                }
         medications = []
 
     return {
