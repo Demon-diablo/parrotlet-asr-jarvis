@@ -26,6 +26,10 @@ import sys
 import time
 from contextlib import asynccontextmanager
 
+# Blackwell SM 12.0 / FlashInfer compatibility defaults
+os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+os.environ.setdefault("FLASHINFER_CUDA_ARCH_LIST", "9.0")
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)

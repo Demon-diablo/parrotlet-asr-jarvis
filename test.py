@@ -223,6 +223,9 @@ def main():
     else:
         print(f"[Health Check] Status: {s} | {b[:300]}")
 
+    import mimetypes
+    ctype = mimetypes.guess_type(a.audio)[0] or "application/octet-stream"
+
     bound = uuid.uuid4().hex.encode()
     data = Path(a.audio).read_bytes()
     body = (
@@ -230,7 +233,9 @@ def main():
         + bound
         + b'\r\nContent-Disposition: form-data; name="file"; filename="'
         + Path(a.audio).name.encode()
-        + b'"\r\nContent-Type: audio/ogg\r\n\r\n'
+        + b'"\r\nContent-Type: '
+        + ctype.encode()
+        + b'\r\n\r\n'
         + data
         + b"\r\n--"
         + bound

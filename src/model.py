@@ -367,6 +367,88 @@ def _patch_gemma3_inputs_embeds() -> None:
         log.debug("Gemma3 inputs_embeds patch skipped: %s", exc)
 
 
+def _patch_speech_llm_transcribe(SpeechLLM: Any) -> None:
+    """Patch upstream SpeechLLM.transcribe to ensure float32 audio features match encoder dtype."""
+    if not hasattr(SpeechLLM, "transcribe"):
+        return
+    orig_transcribe = SpeechLLM.transcribe
+    if getattr(orig_transcribe, "_is_patched", False):
+        return
+
+    def _patched_transcribe(self, audio, orig_sr, max_new_tokens=256, repetition_penalty=1.2, **gen_kwargs):
+        device = gen_kwargs.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+        prompt = self.get_prompt()
+
+        input_ids = torch.tensor(self.tokenizer(prompt, add_special_tokens=False)["input_ids"])
+        input_attention_mask = torch.ones_like(input_ids)
+
+        audio_token = self.tokenizer.convert_tokens_to_ids(self.audio_token)
+        audio_pos = input_ids.tolist().index(audio_token)
+
+        input_ids = input_ids.unsqueeze(0).to(device)
+        input_attention_mask = input_attention_mask.unsqueeze(0).to(device)
+
+        processed_audio = self.preprocess_audio(audio, orig_sr)
+
+        audio_features = self.processor.feature_extractor(
+            [processed_audio], sampling_rate=self.sampling_rate, return_tensors="pt"
+        ).input_features
+        enc_dtype = next(self.encoder.parameters()).dtype if hasattr(self, "encoder") else torch.float32
+        audio_features = audio_features.to(device=device, dtype=enc_dtype)
+
+        with torch.no_grad():
+            audio_embeddings = self.encoder(audio_features).last_hidden_state
+            proj_dtype = next(self.projector.parameters()).dtype if hasattr(self, "projector") else enc_dtype
+            projected_audio_embeddings = self.projector(audio_embeddings.to(dtype=proj_dtype))
+
+        input_embeddings = self.decoder.get_input_embeddings()(input_ids)
+        batch_size, input_seq_len, embed_dim = input_embeddings.shape
+        audio_seq_len = projected_audio_embeddings.shape[1]
+
+        max_combined_len = input_seq_len + audio_seq_len - 1
+
+        combined_embeddings = torch.zeros(
+            batch_size, max_combined_len, embed_dim, device=device, dtype=input_embeddings.dtype
+        )
+        combined_attention_mask = torch.zeros(
+            batch_size, max_combined_len, device=device, dtype=input_attention_mask.dtype
+        )
+
+        combined_embeddings[:, :audio_pos] = input_embeddings[:, :audio_pos]
+        combined_attention_mask[:, :audio_pos] = input_attention_mask[:, :audio_pos]
+
+        combined_embeddings[:, audio_pos : audio_pos + audio_seq_len] = projected_audio_embeddings
+        combined_attention_mask[:, audio_pos : audio_pos + audio_seq_len] = 1
+
+        suffix_start = audio_pos + 1
+        suffix_len = input_seq_len - suffix_start
+        out_start = audio_pos + audio_seq_len
+        combined_embeddings[:, out_start : out_start + suffix_len] = input_embeddings[:, suffix_start:]
+        combined_attention_mask[:, out_start : out_start + suffix_len] = input_attention_mask[:, suffix_start:]
+
+        default_gen_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": False,
+            "repetition_penalty": repetition_penalty,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+        }
+        default_gen_kwargs.update(gen_kwargs)
+
+        with torch.no_grad():
+            outputs = self.decoder.generate(
+                inputs_embeds=combined_embeddings,
+                attention_mask=combined_attention_mask,
+                **default_gen_kwargs,
+            )
+
+        return self.tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+
+    _patched_transcribe._is_patched = True
+    SpeechLLM.transcribe = _patched_transcribe
+    log.info("Patched SpeechLLM.transcribe for dtype casting and inputs_embeds compatibility")
+
+
 # ---------------------------------------------------------------------------
 # Real loaders (Phase 3).
 # ---------------------------------------------------------------------------
@@ -456,6 +538,7 @@ def _load_speech_llm(settings: Settings, hf_kwargs: Dict[str, Any], device: str,
 
     SpeechLLM = getattr(mod, "SpeechLLM")
     SpeechLLMConfig = getattr(mod, "SpeechLLMConfig")
+    _patch_speech_llm_transcribe(SpeechLLM)
 
     # Step 3: register so AutoModel dispatch works (also called inside
     # the upstream ``__main__`` branch which won't run for us).
